@@ -1,0 +1,1476 @@
+--[[
+	Magic Mail Pipeline (full)
+
+	Fall Harvest (FH loop armed):
+	  every 10s → claim matching mailbox from partner
+	  → Magic-Mail exact selected amount (lowest tier, multi-mail, rate-limit safe)
+	  → ONLY travel GV after ALL units sent successfully
+
+	Garden Valley (pipeline armed):
+	  claim Magic Mail escrow → regular-mail partner → travel FH
+
+	Seeds: 10 / Magic Mail | Gear: 1 / Magic Mail
+	Tier: lowest that can carry the item
+]]
+
+print("[MMT] Starting...")
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local K_USER = "MMT_Username"
+local K_UID = "MMT_UserId"
+local K_DISPLAY = "MMT_Display"
+local K_PIPELINE = "MMT_Pipeline"
+local K_TIER = "MMT_Tier"
+local K_CAT = "MMT_Cat"
+local K_ITEM = "MMT_Item"
+local K_COUNT = "MMT_Count"
+local K_ARMED_FH = "MMT_ArmedFH"
+
+local function tsSet(k, v)
+	pcall(function()
+		TeleportService:SetTeleportSetting(k, v)
+	end)
+end
+
+local function tsGet(k)
+	local ok, v = pcall(function()
+		return TeleportService:GetTeleportSetting(k)
+	end)
+	return ok and v or nil
+end
+
+local function saveRecipient(username, userId, display)
+	tsSet(K_USER, tostring(username or ""))
+	tsSet(K_UID, tonumber(userId) or 0)
+	tsSet(K_DISPLAY, tostring(display or ""))
+end
+
+local function loadRecipient()
+	local u, id, d = tsGet(K_USER), tsGet(K_UID), tsGet(K_DISPLAY)
+	if type(u) ~= "string" then u = "" end
+	if type(id) ~= "number" then id = 0 end
+	if type(d) ~= "string" then d = "" end
+	return u, id, d
+end
+
+local function saveSelection(tier, cat, item, count)
+	tsSet(K_TIER, tostring(tier or ""))
+	tsSet(K_CAT, tostring(cat or "Seeds"))
+	tsSet(K_ITEM, tostring(item or ""))
+	tsSet(K_COUNT, tonumber(count) or 1)
+end
+
+local function loadSelection()
+	local tier, cat, item, count = tsGet(K_TIER), tsGet(K_CAT), tsGet(K_ITEM), tsGet(K_COUNT)
+	if type(tier) ~= "string" or tier == "" then tier = "Rare Magic Mail" end
+	if type(cat) ~= "string" or cat == "" then cat = "Seeds" end
+	if type(item) ~= "string" then item = "" end
+	if type(count) ~= "number" or count <= 0 then count = 10 end
+	return tier, cat, item, count
+end
+
+local function setPipeline(on)
+	tsSet(K_PIPELINE, on and "1" or "0")
+end
+local function pipelineArmed()
+	return tsGet(K_PIPELINE) == "1"
+end
+local function setFhArmed(on)
+	tsSet(K_ARMED_FH, on and "1" or "0")
+end
+local function fhArmed()
+	return tsGet(K_ARMED_FH) == "1"
+end
+
+local Networking
+do
+	local ok, mod = pcall(require, ReplicatedStorage.SharedModules.Networking)
+	if ok then
+		Networking = mod
+		print("[MMT] Networking OK")
+	else
+		warn("[MMT] Networking failed:", mod)
+	end
+end
+
+local Worlds
+pcall(function()
+	Worlds = require(ReplicatedStorage.SharedModules.Worlds)
+end)
+
+local SEEDS = {
+	["Rare Magic Mail"] = {
+		"Maple Carrot", "Maple Strawberry", "Maple Blueberry", "Maple Tulip",
+		"Maple Tomato", "Maple Apple", "Maple Bamboo", "Maple Corn",
+		"Maple Cactus", "Maple Pineapple", "Potato",
+	},
+	["Legendary Magic Mail"] = {
+		"Maple Carrot", "Maple Strawberry", "Maple Blueberry", "Maple Tulip",
+		"Maple Tomato", "Maple Apple", "Maple Bamboo", "Maple Corn",
+		"Maple Cactus", "Maple Pineapple", "Potato",
+		"Maple Coconut", "Cinnamon Stick", "Maple Mushroom", "Maple Green Bean",
+		"Maple Mango", "Maple Grape", "Maple Banana", "Plum",
+		"Atlantic Giant Pumpkin", "Maple Sunflower", "Maple Cherry", "Maple Acorn",
+		"Maple Dragon Fruit", "Honeysuckle",
+	},
+	["Super Magic Mail"] = {
+		"Maple Carrot", "Maple Strawberry", "Maple Blueberry", "Maple Tulip",
+		"Maple Tomato", "Maple Apple", "Maple Bamboo", "Maple Corn",
+		"Maple Cactus", "Maple Pineapple", "Potato",
+		"Maple Coconut", "Cinnamon Stick", "Maple Mushroom", "Maple Green Bean",
+		"Maple Mango", "Maple Grape", "Maple Banana", "Plum",
+		"Atlantic Giant Pumpkin", "Maple Sunflower", "Maple Cherry", "Maple Acorn",
+		"Maple Dragon Fruit", "Honeysuckle",
+		"Romanesco", "Conifer Cone", "Conifer Cone Sapling",
+		"Maple Venom Spitter", "Maple Poison Apple", "Maple Pomegranate",
+		"Maple Venus Fly Trap", "Amber Cranberry",
+	},
+}
+
+local GEARS = {
+	["Rare Magic Mail"] = {
+		{ name = "Syrup Sprinkler", category = "Sprinklers" },
+		{ name = "Syrup Watering Can", category = "WateringCans" },
+	},
+	["Legendary Magic Mail"] = {
+		{ name = "Syrup Sprinkler", category = "Sprinklers" },
+		{ name = "Syrup Watering Can", category = "WateringCans" },
+	},
+	["Super Magic Mail"] = {
+		{ name = "Syrup Sprinkler", category = "Sprinklers" },
+		{ name = "Syrup Watering Can", category = "WateringCans" },
+		{ name = "Super Syrup Sprinkler", category = "Sprinklers" },
+		{ name = "Super Syrup Watering Can", category = "WateringCans" },
+	},
+}
+
+local function gearNames(tier)
+	local t = {}
+	for _, g in ipairs(GEARS[tier] or {}) do
+		table.insert(t, g.name)
+	end
+	return t
+end
+
+local function gearCategory(tier, name)
+	for _, g in ipairs(GEARS[tier] or {}) do
+		if g.name == name then
+			return g.category
+		end
+	end
+	return "Sprinklers"
+end
+
+local function worldId()
+	return (Worlds and Worlds.CurrentId) or nil
+end
+local function isGV()
+	return worldId() == "Main"
+end
+local function isFH()
+	return worldId() == "FallHarvest"
+end
+
+local pendingEscrow = {}
+local claimedForMail = {}
+local busy = false
+local dumpedInboxOnce = false
+
+-- ── Tier / multi-mail ──
+
+local function lowestTierFor(itemName, uiCat)
+	local function inList(tier)
+		if uiCat == "Seeds" then
+			for _, n in ipairs(SEEDS[tier] or {}) do
+				if n == itemName then
+					return true
+				end
+			end
+			return false
+		end
+		for _, g in ipairs(GEARS[tier] or {}) do
+			if g.name == itemName then
+				return true
+			end
+		end
+		return false
+	end
+	if inList("Rare Magic Mail") then
+		return "Rare Magic Mail"
+	end
+	if inList("Legendary Magic Mail") then
+		return "Legendary Magic Mail"
+	end
+	if inList("Super Magic Mail") then
+		return "Super Magic Mail"
+	end
+	return nil
+end
+
+local function unitsPerMail(uiCat)
+	return (uiCat == "Seeds") and 10 or 1
+end
+
+local function packetCategoryFor(tier, uiCat, itemKey)
+	if uiCat == "Seeds" then
+		return "Seeds"
+	end
+	return gearCategory(tier, itemKey)
+end
+
+--[[
+	Sends exactly totalCount units across as many Magic Mails as needed.
+	Returns success ONLY if unitsSent == totalCount (full amount).
+	Handles "Sending too fast" with retries + delay between mails.
+]]
+local function magicMailSendTotal(uiCat, itemKey, totalCount)
+	totalCount = math.floor(tonumber(totalCount) or 0)
+	if totalCount <= 0 then
+		return false, "bad count", 0, 0, nil
+	end
+	if type(itemKey) ~= "string" or itemKey == "" then
+		return false, "no item", 0, 0, nil
+	end
+	if not Networking or not Networking.MagicMail or not Networking.MagicMail.Send then
+		return false, "Send missing", 0, 0, nil
+	end
+
+	local tier = lowestTierFor(itemKey, uiCat)
+	if not tier then
+		return false, "item not Magic-Mailable", 0, 0, nil
+	end
+
+	local per = unitsPerMail(uiCat)
+	local packetCategory = packetCategoryFor(tier, uiCat, itemKey)
+	local remaining = totalCount
+	local mailsUsed, unitsSent = 0, 0
+
+	local BETWEEN_MAILS = 2.75
+	local MAX_RETRIES = 5
+
+	print(string.format(
+		"[MMT] Plan: %s x%d → %s (%d/mail, need %d successful mail(s))",
+		itemKey, totalCount, tier, per, math.ceil(totalCount / per)
+	))
+
+	while remaining > 0 do
+		local batch = math.min(per, remaining)
+		local success, message
+		local attempt = 0
+
+		while true do
+			attempt += 1
+			print("[MMT] MagicMail.Send", tier, packetCategory, itemKey, batch, "(try", attempt .. ")")
+
+			local ok, s, m = pcall(function()
+				return Networking.MagicMail.Send:Fire(tier, packetCategory, itemKey, batch)
+			end)
+
+			if not ok then
+				return false, "client error: " .. tostring(s), mailsUsed, unitsSent, tier
+			end
+
+			success, message = s, m
+			print("[MMT] response", success, message)
+
+			if success == true then
+				break
+			end
+
+			local msgStr = string.lower(tostring(message or ""))
+			local tooFast = string.find(msgStr, "too fast", 1, true)
+				or string.find(msgStr, "try again", 1, true)
+				or string.find(msgStr, "cooldown", 1, true)
+				or string.find(msgStr, "moment", 1, true)
+
+			if tooFast and attempt < MAX_RETRIES then
+				local waitSec = BETWEEN_MAILS + (attempt * 0.75)
+				print("[MMT] Rate limited – waiting", waitSec, "s then retry")
+				task.wait(waitSec)
+			else
+				-- Hard fail: do NOT report overall success
+				return false, message or "rejected", mailsUsed, unitsSent, tier
+			end
+		end
+
+		mailsUsed += 1
+		unitsSent += batch
+		remaining -= batch
+
+		if remaining > 0 then
+			print("[MMT] Waiting", BETWEEN_MAILS, "s before next Magic Mail…")
+			task.wait(BETWEEN_MAILS)
+		end
+	end
+
+	-- Gate: must have sent the full requested amount
+	if unitsSent < totalCount then
+		return false, string.format("partial send %d/%d", unitsSent, totalCount), mailsUsed, unitsSent, tier
+	end
+
+	return true, nil, mailsUsed, unitsSent, tier
+end
+
+-- ── Shared ──
+
+local function normalizeList(result)
+	local out = {}
+	if type(result) ~= "table" then
+		return out
+	end
+	local hasStringKeys = false
+	for k, v in pairs(result) do
+		if type(k) == "string" then
+			hasStringKeys = true
+			table.insert(out, { id = k, data = v })
+		end
+	end
+	if hasStringKeys then
+		return out
+	end
+	for _, v in ipairs(result) do
+		if type(v) == "string" then
+			table.insert(out, { id = v, data = v })
+		elseif type(v) == "table" then
+			table.insert(out, { id = v.Id or v.EscrowId or v.id, data = v })
+		end
+	end
+	return out
+end
+
+local function escrowToMailEntry(data)
+	if type(data) ~= "table" then
+		return nil
+	end
+	local it = data.Item
+	if type(it) ~= "table" then
+		return nil
+	end
+	local cat = it.Category
+	local name = it.ItemName or it.Name
+	local count = tonumber(it.Count) or 1
+	if type(cat) ~= "string" or type(name) ~= "string" or count <= 0 then
+		return nil
+	end
+	return { Category = cat, ItemKey = name, Count = count }
+end
+
+local function mergeClaimed(entry)
+	for _, e in ipairs(claimedForMail) do
+		if e.Category == entry.Category and e.ItemKey == entry.ItemKey then
+			e.Count += entry.Count
+			return
+		end
+	end
+	table.insert(claimedForMail, {
+		Category = entry.Category,
+		ItemKey = entry.ItemKey,
+		Count = entry.Count,
+	})
+end
+
+local function travelTo(id)
+	if not Networking or not Networking.Worlds or not Networking.Worlds.RequestTravel then
+		warn("[MMT] RequestTravel missing")
+		return false
+	end
+	print("[MMT] Travel", id)
+	local ok, err = pcall(function()
+		Networking.Worlds.RequestTravel:Fire(id)
+	end)
+	if not ok then
+		warn("[MMT] Travel error:", err)
+	end
+	return ok
+end
+
+local function lookupPlayer(username)
+	if not Networking or not Networking.Mailbox or not Networking.Mailbox.LookupPlayer then
+		return nil, nil, "LookupPlayer missing"
+	end
+	local name = string.gsub(username or "", "^%s*@?", "")
+	name = string.gsub(name, "%s+$", "")
+	if #name < 3 then
+		return nil, nil, "username too short"
+	end
+	local ok, userId, display = pcall(function()
+		return Networking.Mailbox.LookupPlayer:Fire(name)
+	end)
+	if not ok then
+		return nil, nil, tostring(userId)
+	end
+	if type(userId) ~= "number" or userId <= 0 then
+		return nil, nil, display or "not found"
+	end
+	return userId, display or name, nil
+end
+
+local function loadHeadshot(userId, imageLabel)
+	if not imageLabel then
+		return
+	end
+	local ok, content = pcall(function()
+		return Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+	end)
+	if ok and content then
+		imageLabel.Image = content
+	else
+		imageLabel.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=48&h=48", userId)
+	end
+	imageLabel.Visible = true
+end
+
+-- ── Mailbox ──
+
+local function openInbox()
+	if not Networking or not Networking.Mailbox or not Networking.Mailbox.OpenInbox then
+		return nil
+	end
+	local ok, result = pcall(function()
+		return Networking.Mailbox.OpenInbox:Fire()
+	end)
+	if not ok then
+		warn("[MMT] OpenInbox error:", result)
+		return nil
+	end
+	return result
+end
+
+local function iterInbox(result)
+	local list = {}
+	if type(result) ~= "table" then
+		return list
+	end
+
+	local hasStringKeys = false
+	for k, v in pairs(result) do
+		if type(k) == "string" and type(v) == "table" then
+			hasStringKeys = true
+			table.insert(list, {
+				Id = k,
+				_keyId = k,
+				data = v,
+				raw = v,
+			})
+		end
+	end
+	if hasStringKeys then
+		return list
+	end
+
+	if result[1] ~= nil then
+		for _, v in ipairs(result) do
+			if type(v) == "table" then
+				table.insert(list, {
+					Id = v.Id or v.MailId or v.id or v.Key,
+					data = v,
+					raw = v,
+				})
+			end
+		end
+		return list
+	end
+
+	for _, key in ipairs({ "Mail", "Inbox", "Entries", "Gifts", "Items" }) do
+		if type(result[key]) == "table" then
+			for k, v in pairs(result[key]) do
+				if type(v) == "table" then
+					local id = (type(k) == "string" and k) or v.Id or v.MailId or v.id
+					table.insert(list, { Id = id, data = v, raw = v })
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function getMailId(row)
+	if type(row) ~= "table" then
+		return nil
+	end
+	if type(row.Id) == "string" and row.Id ~= "" then
+		return row.Id
+	end
+	if type(row._keyId) == "string" then
+		return row._keyId
+	end
+	local d = row.data or row.raw or row
+	if type(d) == "table" then
+		return d.Id or d.MailId or d.id or d.Key or d.mailId
+	end
+	return nil
+end
+
+local function mailSenderMatches(entry, targetUserId, targetName)
+	local function check(t)
+		if type(t) ~= "table" then
+			return false
+		end
+		local uid = t.UserId or t.SenderUserId or t.FromUserId or t.SenderId or t.FromId
+		if type(uid) == "number" and targetUserId > 0 and uid == targetUserId then
+			return true
+		end
+		local n = t.Name or t.SenderName or t.FromName or t.Username or t.DisplayName or t.Sender
+		if type(n) == "string" and targetName ~= "" and string.lower(n) == string.lower(targetName) then
+			return true
+		end
+		if type(t.Sender) == "table" and check(t.Sender) then
+			return true
+		end
+		if type(t.From) == "table" and check(t.From) then
+			return true
+		end
+		return false
+	end
+	if check(entry) then
+		return true
+	end
+	if type(entry) == "table" then
+		return check(entry.data) or check(entry.raw)
+	end
+	return false
+end
+
+local function countWantedInEntry(entry, wantItem, wantCat)
+	if not wantItem or wantItem == "" then
+		return 0
+	end
+	local total = 0
+	local function checkOne(it)
+		if type(it) ~= "table" then
+			return
+		end
+		local key = it.ItemKey or it.ItemName or it.Name or it.SeedName
+		local cat = it.Category
+		local c = tonumber(it.Count or it.Amount) or 1
+		if type(key) == "string" and string.lower(key) == string.lower(wantItem) then
+			if wantCat ~= "Seeds" or cat == nil or cat == "Seeds" then
+				total += c
+			end
+		end
+	end
+	local function scan(t)
+		if type(t) ~= "table" then
+			return
+		end
+		checkOne(t)
+		local items = t.Items or t.Batch or t.Contents or t.Gifts or t.Entry or t.Item
+		if type(items) == "table" then
+			if items.ItemKey or items.ItemName or items.Name then
+				checkOne(items)
+			else
+				for _, it in pairs(items) do
+					checkOne(it)
+				end
+			end
+		end
+	end
+	scan(entry)
+	if type(entry) == "table" then
+		scan(entry.data)
+		scan(entry.raw)
+	end
+	return total
+end
+
+local function claimMailId(id)
+	if not id or not Networking or not Networking.Mailbox or not Networking.Mailbox.Claim then
+		return false
+	end
+	local ok, success, message = pcall(function()
+		return Networking.Mailbox.Claim:Fire(tostring(id))
+	end)
+	print("[MMT] Mailbox.Claim", id, "→", success, message)
+	return ok and success == true
+end
+
+local function claimMatchingFromUser(targetUserId, targetName, wantItem, wantCat)
+	local inbox = openInbox()
+	if inbox == nil then
+		return false, 0, 0, "OpenInbox failed"
+	end
+
+	if not dumpedInboxOnce and type(inbox) == "table" then
+		dumpedInboxOnce = true
+		local n = 0
+		for k, v in pairs(inbox) do
+			n += 1
+			if n <= 4 then
+				local keys = {}
+				if type(v) == "table" then
+					for fk in pairs(v) do
+						table.insert(keys, tostring(fk))
+					end
+				end
+				print("[MMT] inbox key=", tostring(k), " valueKeys=", table.concat(keys, ","))
+			end
+		end
+	end
+
+	local entries = iterInbox(inbox)
+	print("[MMT] Inbox entries:", #entries)
+	if #entries == 0 then
+		return false, 0, 0, "inbox empty"
+	end
+
+	local unitsFound = 0
+	local toClaim = {}
+
+	for _, row in ipairs(entries) do
+		local fromTarget = mailSenderMatches(row, targetUserId, targetName)
+		local units = countWantedInEntry(row, wantItem, wantCat)
+		local id = getMailId(row)
+
+		if fromTarget and units > 0 then
+			print("[MMT] From partner: id=", id, " units of", wantItem, "=", units)
+			if id then
+				unitsFound += units
+				table.insert(toClaim, { id = id, units = units })
+			else
+				print("[MMT] SKIP – matched item but no mail id")
+			end
+		elseif units > 0 and not fromTarget then
+			print("[MMT] Item match, sender mismatch, id=", id)
+		end
+	end
+
+	if #toClaim == 0 then
+		for _, row in ipairs(entries) do
+			local units = countWantedInEntry(row, wantItem, wantCat)
+			local id = getMailId(row)
+			if units > 0 and id then
+				print("[MMT] Fallback claim id=", id, " units=", units)
+				unitsFound += units
+				table.insert(toClaim, { id = id, units = units })
+			end
+		end
+	end
+
+	if #toClaim == 0 then
+		return false, 0, 0, "no claimable matching mail"
+	end
+
+	local claimed = 0
+	for _, row in ipairs(toClaim) do
+		if claimMailId(row.id) then
+			claimed += 1
+		end
+		task.wait(0.45)
+	end
+
+	if claimed <= 0 then
+		return false, unitsFound, 0, "claim calls failed"
+	end
+	return true, unitsFound, claimed, "ok"
+end
+
+-- ── Magic Mail claim (GV) ──
+
+local function refreshMM()
+	if not Networking or not Networking.MagicMail or not Networking.MagicMail.List then
+		return
+	end
+	local ok, result = pcall(function()
+		return Networking.MagicMail.List:Fire()
+	end)
+	if ok then
+		pendingEscrow = normalizeList(result)
+	end
+end
+
+local function claimMMId(id)
+	local ok, success, message = pcall(function()
+		return Networking.MagicMail.Claim:Fire(tostring(id))
+	end)
+	print("[MMT] MM Claim", id, success, message)
+	return ok and success == true
+end
+
+local function claimAllMM()
+	refreshMM()
+	if #pendingEscrow == 0 or not isGV() then
+		return 0
+	end
+	table.clear(claimedForMail)
+	local n = 0
+	for _, item in ipairs(pendingEscrow) do
+		if claimMMId(item.id) then
+			n += 1
+			local e = escrowToMailEntry(item.data)
+			if e then
+				mergeClaimed(e)
+			end
+		end
+		task.wait(0.45)
+	end
+	refreshMM()
+	return n
+end
+
+local function buildBatches(entries, maxUnits)
+	maxUnits = maxUnits or 20
+	local batches, current, units = {}, {}, 0
+	for _, e in ipairs(entries) do
+		local left = e.Count
+		while left > 0 do
+			local room = maxUnits - units
+			if room <= 0 then
+				table.insert(batches, current)
+				current, units, room = {}, 0, maxUnits
+			end
+			local take = math.min(left, room)
+			table.insert(current, {
+				Category = e.Category,
+				ItemKey = e.ItemKey,
+				Count = take,
+			})
+			units += take
+			left -= take
+		end
+	end
+	if #current > 0 then
+		table.insert(batches, current)
+	end
+	return batches
+end
+
+local function sendMailBatches(userId, entries, note)
+	if not Networking or not Networking.Mailbox or not Networking.Mailbox.SendBatch then
+		return false, "SendBatch missing"
+	end
+	local batches = buildBatches(entries, 20)
+	if #batches == 0 then
+		return false, "no items"
+	end
+	for i, batch in ipairs(batches) do
+		local ok, success, message = pcall(function()
+			return Networking.Mailbox.SendBatch:Fire(userId, batch, note or "")
+		end)
+		print("[MMT] SendBatch", i, success, message)
+		if not ok or success ~= true then
+			return false, message or tostring(success)
+		end
+		if i < #batches then
+			task.wait(1.75)
+		end
+	end
+	return true, nil
+end
+
+if Networking and Networking.MagicMail and Networking.MagicMail.Updated then
+	pcall(function()
+		Networking.MagicMail.Updated.OnClientEvent:Connect(function(payload)
+			if type(payload) == "table" then
+				pendingEscrow = normalizeList(payload)
+			end
+		end)
+	end)
+end
+
+-- ─────────────────────────────────────────
+-- UI
+-- ─────────────────────────────────────────
+
+pcall(function()
+	local old = PlayerGui:FindFirstChild("MagicMailTester")
+	if old then
+		old:Destroy()
+	end
+end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MagicMailTester"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 999
+gui.IgnoreGuiInset = true
+gui.Parent = PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(360, 600)
+frame.Position = UDim2.new(0.5, -180, 0.5, -300)
+frame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(70, 70, 80)
+stroke.Thickness = 1
+stroke.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -50, 0, 28)
+title.Position = UDim2.fromOffset(12, 6)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 17
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "Magic Mail Pipeline"
+title.Parent = frame
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -36, 0, 6)
+closeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+closeBtn.Text = "X"
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.Parent = frame
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+closeBtn.MouseButton1Click:Connect(function()
+	gui:Destroy()
+end)
+
+local function makeLabel(text, y)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, -24, 0, 15)
+	l.Position = UDim2.fromOffset(12, y)
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.Gotham
+	l.TextSize = 12
+	l.TextColor3 = Color3.fromRGB(170, 170, 180)
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Text = text
+	l.Parent = frame
+end
+
+local activeList, activeButton, ignoreNextOutside = nil, nil, false
+local function closeDropdown()
+	if activeList then
+		activeList.Visible = false
+		activeList, activeButton = nil, nil
+	end
+end
+
+local function makeDropdown(y, options, default)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -24, 0, 28)
+	btn.Position = UDim2.fromOffset(12, y)
+	btn.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+	btn.BorderSizePixel = 0
+	btn.Font = Enum.Font.Gotham
+	btn.TextSize = 13
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.TextXAlignment = Enum.TextXAlignment.Left
+	btn.Text = "  " .. tostring(default or options[1] or "(none)")
+	btn.Parent = frame
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+	local list = Instance.new("ScrollingFrame")
+	list.BackgroundColor3 = Color3.fromRGB(36, 36, 42)
+	list.BorderSizePixel = 0
+	list.Visible = false
+	list.ZIndex = 60
+	list.ScrollBarThickness = 5
+	list.Parent = frame
+	Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local current = default or options[1] or ""
+	local onChanged = nil
+	local optionButtons = {}
+
+	local function rebuild(newOptions, keepValue)
+		options = newOptions or {}
+		for _, b in ipairs(optionButtons) do
+			b:Destroy()
+		end
+		table.clear(optionButtons)
+		if #options == 0 then
+			current = ""
+			btn.Text = "  (none)"
+		elseif not keepValue or not table.find(options, current) then
+			current = options[1]
+			btn.Text = "  " .. tostring(current)
+		else
+			btn.Text = "  " .. tostring(current)
+		end
+		local h = math.min(130, math.max(28, #options * 26))
+		list.Size = UDim2.new(1, -24, 0, h)
+		list.CanvasSize = UDim2.fromOffset(0, #options * 26)
+		list.Position = UDim2.fromOffset(12, y + 32)
+		for i, opt in ipairs(options) do
+			local ob = Instance.new("TextButton")
+			ob.Size = UDim2.new(1, 0, 0, 26)
+			ob.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+			ob.BorderSizePixel = 0
+			ob.Font = Enum.Font.Gotham
+			ob.TextSize = 12
+			ob.TextColor3 = Color3.fromRGB(230, 230, 235)
+			ob.TextXAlignment = Enum.TextXAlignment.Left
+			ob.Text = "  " .. tostring(opt)
+			ob.ZIndex = 61
+			ob.LayoutOrder = i
+			ob.Parent = list
+			table.insert(optionButtons, ob)
+			ob.MouseButton1Click:Connect(function()
+				current = opt
+				btn.Text = "  " .. tostring(opt)
+				closeDropdown()
+				if onChanged then
+					onChanged(opt)
+				end
+			end)
+		end
+	end
+	rebuild(options, true)
+
+	btn.MouseButton1Click:Connect(function()
+		if activeList == list then
+			closeDropdown()
+		else
+			closeDropdown()
+			list.Visible = true
+			activeList, activeButton = list, btn
+			ignoreNextOutside = true
+		end
+	end)
+
+	return {
+		Get = function()
+			return current
+		end,
+		Set = function(v)
+			current = v
+			btn.Text = "  " .. tostring(v)
+		end,
+		SetOptions = function(opts, keep)
+			rebuild(opts, keep)
+		end,
+		OnChanged = function(fn)
+			onChanged = fn
+		end,
+	}
+end
+
+UserInputService.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+	if ignoreNextOutside then
+		ignoreNextOutside = false
+		return
+	end
+	if not activeList then
+		return
+	end
+	local pos = UserInputService:GetMouseLocation() - GuiService:GetGuiInset()
+	local objs = PlayerGui:GetGuiObjectsAtPosition(pos.X, pos.Y)
+	for _, obj in ipairs(objs) do
+		if obj == activeList or obj:IsDescendantOf(activeList) then
+			return
+		end
+		if activeButton and (obj == activeButton or obj:IsDescendantOf(activeButton)) then
+			return
+		end
+	end
+	closeDropdown()
+end)
+
+local savedUser, savedUid, savedDisplay = loadRecipient()
+local savedTier, savedCat, savedItem, savedCount = loadSelection()
+
+makeLabel("Category", 34)
+local catDrop = makeDropdown(50, { "Seeds", "Gear" }, savedCat)
+
+makeLabel("Item required from partner (only this)", 84)
+local defaultItems = (savedCat == "Gear") and gearNames("Super Magic Mail")
+	or (SEEDS["Super Magic Mail"] or SEEDS["Rare Magic Mail"])
+local itemDrop = makeDropdown(100, defaultItems, savedItem ~= "" and savedItem or nil)
+
+makeLabel("Amount to Magic-Mail after claim", 134)
+local countBox = Instance.new("TextBox")
+countBox.Size = UDim2.new(1, -24, 0, 28)
+countBox.Position = UDim2.fromOffset(12, 150)
+countBox.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+countBox.BorderSizePixel = 0
+countBox.Font = Enum.Font.Gotham
+countBox.TextSize = 13
+countBox.TextColor3 = Color3.new(1, 1, 1)
+countBox.Text = tostring(savedCount)
+countBox.ClearTextOnFocus = false
+countBox.Parent = frame
+Instance.new("UICorner", countBox).CornerRadius = UDim.new(0, 6)
+
+local planLabel = Instance.new("TextLabel")
+planLabel.Size = UDim2.new(1, -24, 0, 18)
+planLabel.Position = UDim2.fromOffset(12, 182)
+planLabel.BackgroundTransparency = 1
+planLabel.Font = Enum.Font.Gotham
+planLabel.TextSize = 11
+planLabel.TextColor3 = Color3.fromRGB(140, 200, 160)
+planLabel.TextXAlignment = Enum.TextXAlignment.Left
+planLabel.Text = "Plan: …"
+planLabel.Parent = frame
+
+local function refreshPlan()
+	local cat = catDrop.Get()
+	local item = itemDrop.Get()
+	local count = tonumber(countBox.Text) or 0
+	local tier = lowestTierFor(item, cat)
+	if not tier then
+		planLabel.Text = "Plan: item not Magic-Mailable"
+		planLabel.TextColor3 = Color3.fromRGB(255, 140, 80)
+		return
+	end
+	local per = unitsPerMail(cat)
+	local mails = math.max(1, math.ceil(math.max(count, 1) / per))
+	planLabel.Text = string.format("Plan: %s × %d → %s × %d mail(s)", item, count, tier, mails)
+	planLabel.TextColor3 = Color3.fromRGB(140, 200, 160)
+end
+
+local function persistSelection()
+	local tier = lowestTierFor(itemDrop.Get(), catDrop.Get()) or "Rare Magic Mail"
+	saveSelection(tier, catDrop.Get(), itemDrop.Get(), tonumber(countBox.Text) or 1)
+	refreshPlan()
+end
+
+catDrop.OnChanged(function()
+	if catDrop.Get() == "Seeds" then
+		itemDrop.SetOptions(SEEDS["Super Magic Mail"] or SEEDS["Rare Magic Mail"])
+		countBox.Text = "10"
+	else
+		itemDrop.SetOptions(gearNames("Super Magic Mail"))
+		countBox.Text = "1"
+	end
+	persistSelection()
+end)
+itemDrop.OnChanged(persistSelection)
+countBox:GetPropertyChangedSignal("Text"):Connect(persistSelection)
+
+if savedCat == "Gear" then
+	itemDrop.SetOptions(gearNames("Super Magic Mail"), true)
+	if savedItem ~= "" then
+		itemDrop.Set(savedItem)
+	end
+elseif savedItem ~= "" then
+	itemDrop.Set(savedItem)
+end
+refreshPlan()
+
+makeLabel("Partner username (must mail you this item)", 206)
+local userBox = Instance.new("TextBox")
+userBox.Size = UDim2.new(1, -24, 0, 28)
+userBox.Position = UDim2.fromOffset(12, 222)
+userBox.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+userBox.BorderSizePixel = 0
+userBox.Font = Enum.Font.Gotham
+userBox.TextSize = 13
+userBox.TextColor3 = Color3.new(1, 1, 1)
+userBox.PlaceholderText = "Roblox username"
+userBox.PlaceholderColor3 = Color3.fromRGB(120, 120, 130)
+userBox.Text = savedUser
+userBox.ClearTextOnFocus = false
+userBox.Parent = frame
+Instance.new("UICorner", userBox).CornerRadius = UDim.new(0, 6)
+userBox:GetPropertyChangedSignal("Text"):Connect(function()
+	tsSet(K_USER, userBox.Text)
+end)
+
+local confirmRow = Instance.new("Frame")
+confirmRow.Size = UDim2.new(1, -24, 0, 36)
+confirmRow.Position = UDim2.fromOffset(12, 258)
+confirmRow.BackgroundTransparency = 1
+confirmRow.Parent = frame
+
+local confirmBtn = Instance.new("TextButton")
+confirmBtn.Size = UDim2.new(1, -48, 1, 0)
+confirmBtn.BackgroundColor3 = Color3.fromRGB(40, 100, 160)
+confirmBtn.Font = Enum.Font.GothamBold
+confirmBtn.TextSize = 13
+confirmBtn.TextColor3 = Color3.new(1, 1, 1)
+confirmBtn.Text = "Confirm username + arm FH loop"
+confirmBtn.Parent = confirmRow
+Instance.new("UICorner", confirmBtn).CornerRadius = UDim.new(0, 8)
+
+local headshot = Instance.new("ImageLabel")
+headshot.Size = UDim2.fromOffset(36, 36)
+headshot.Position = UDim2.new(1, -36, 0, 0)
+headshot.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+headshot.Visible = false
+headshot.Parent = confirmRow
+Instance.new("UICorner", headshot).CornerRadius = UDim.new(0, 8)
+
+local recipLabel = Instance.new("TextLabel")
+recipLabel.Size = UDim2.new(1, -24, 0, 16)
+recipLabel.Position = UDim2.fromOffset(12, 300)
+recipLabel.BackgroundTransparency = 1
+recipLabel.Font = Enum.Font.Gotham
+recipLabel.TextSize = 12
+recipLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+recipLabel.TextXAlignment = Enum.TextXAlignment.Left
+recipLabel.Text = "Recipient: (not confirmed)"
+recipLabel.Parent = frame
+
+if savedUid > 0 then
+	recipLabel.Text = string.format(
+		"Recipient: %s (%d) ✓",
+		savedDisplay ~= "" and savedDisplay or savedUser,
+		savedUid
+	)
+	recipLabel.TextColor3 = Color3.fromRGB(120, 220, 140)
+	loadHeadshot(savedUid, headshot)
+end
+
+local armBtn = Instance.new("TextButton")
+armBtn.Size = UDim2.new(1, -24, 0, 34)
+armBtn.Position = UDim2.fromOffset(12, 322)
+armBtn.BackgroundColor3 = fhArmed() and Color3.fromRGB(120, 140, 40) or Color3.fromRGB(80, 80, 50)
+armBtn.Font = Enum.Font.GothamBold
+armBtn.TextSize = 13
+armBtn.TextColor3 = Color3.new(1, 1, 1)
+armBtn.Text = fhArmed() and "FH loop: ON (every 10s)" or "FH loop: OFF"
+armBtn.Parent = frame
+Instance.new("UICorner", armBtn).CornerRadius = UDim.new(0, 8)
+
+local worldLabel = Instance.new("TextLabel")
+worldLabel.Size = UDim2.new(1, -24, 0, 16)
+worldLabel.Position = UDim2.fromOffset(12, 364)
+worldLabel.BackgroundTransparency = 1
+worldLabel.Font = Enum.Font.GothamMedium
+worldLabel.TextSize = 11
+worldLabel.TextColor3 = Color3.fromRGB(180, 180, 120)
+worldLabel.TextXAlignment = Enum.TextXAlignment.Left
+worldLabel.Parent = frame
+
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Size = UDim2.new(1, -24, 0, 54)
+infoLabel.Position = UDim2.fromOffset(12, 384)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Font = Enum.Font.Gotham
+infoLabel.TextSize = 11
+infoLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.TextYAlignment = Enum.TextYAlignment.Top
+infoLabel.TextWrapped = true
+infoLabel.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -24, 0, 70)
+status.Position = UDim2.fromOffset(12, 446)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.GothamMedium
+status.TextSize = 12
+status.TextColor3 = Color3.fromRGB(160, 160, 170)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.TextWrapped = true
+status.Text = "Ready"
+status.Parent = frame
+
+local function setStatus(t, c)
+	status.Text = tostring(t)
+	status.TextColor3 = c or Color3.fromRGB(160, 160, 170)
+end
+
+local function updateWorld()
+	local id = worldId() or "?"
+	if id == "Main" then
+		worldLabel.Text = "World: Garden Valley"
+		worldLabel.TextColor3 = Color3.fromRGB(120, 220, 140)
+	elseif id == "FallHarvest" then
+		worldLabel.Text = "World: Fall Harvest"
+		worldLabel.TextColor3 = Color3.fromRGB(220, 180, 100)
+	else
+		worldLabel.Text = "World: " .. tostring(id)
+	end
+end
+
+local function updateInfo()
+	local _, uid, disp = loadRecipient()
+	local item = itemDrop.Get()
+	local cat = catDrop.Get()
+	local count = tonumber(countBox.Text) or 0
+	local tier = lowestTierFor(item, cat)
+	local per = unitsPerMail(cat)
+	local mails = (tier and count > 0) and math.ceil(count / per) or 0
+	infoLabel.Text = string.format(
+		"Partner: %s (%s)\nNeed their mail: %s x%d → %s × %d\nFH loop: %s | GV pipeline: %s",
+		tostring(disp ~= "" and disp or userBox.Text),
+		tostring(uid),
+		tostring(item),
+		count,
+		tostring(tier or "?"),
+		mails,
+		fhArmed() and "ON" or "off",
+		pipelineArmed() and "ARMED" or "off"
+	)
+end
+
+confirmBtn.MouseButton1Click:Connect(function()
+	if busy then
+		return
+	end
+	task.spawn(function()
+		busy = true
+		confirmBtn.Active = false
+		local userId, display, err = lookupPlayer(userBox.Text)
+		if not userId then
+			setStatus("Lookup failed – " .. tostring(err), Color3.fromRGB(255, 90, 90))
+			saveRecipient(userBox.Text, 0, "")
+			setFhArmed(false)
+			armBtn.Text = "FH loop: OFF"
+			armBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 50)
+			busy = false
+			confirmBtn.Active = true
+			updateInfo()
+			return
+		end
+		saveRecipient(userBox.Text, userId, display)
+		persistSelection()
+		setFhArmed(true)
+		armBtn.Text = "FH loop: ON (every 10s)"
+		armBtn.BackgroundColor3 = Color3.fromRGB(120, 140, 40)
+		recipLabel.Text = string.format("Recipient: %s (%d) ✓", tostring(display), userId)
+		recipLabel.TextColor3 = Color3.fromRGB(120, 220, 140)
+		loadHeadshot(userId, headshot)
+		setStatus("Armed – waits for partner to mail the selected item", Color3.fromRGB(80, 220, 120))
+		confirmBtn.Active = true
+		busy = false
+		updateInfo()
+	end)
+end)
+
+armBtn.MouseButton1Click:Connect(function()
+	local _, uid = loadRecipient()
+	if not uid or uid <= 0 then
+		setStatus("Confirm username first", Color3.fromRGB(255, 180, 80))
+		return
+	end
+	local on = not fhArmed()
+	setFhArmed(on)
+	persistSelection()
+	armBtn.Text = on and "FH loop: ON (every 10s)" or "FH loop: OFF"
+	armBtn.BackgroundColor3 = on and Color3.fromRGB(120, 140, 40) or Color3.fromRGB(80, 80, 50)
+	setStatus(on and "FH loop ON – waiting for correct mail" or "FH loop OFF")
+	updateInfo()
+end)
+
+local dragging, dragStart, startPos = false, nil, nil
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+	end
+end)
+title.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local d = input.Position - dragStart
+		frame.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + d.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + d.Y
+		)
+	end
+end)
+
+updateWorld()
+updateInfo()
+
+-- ─────────────────────────────────────────
+-- FALL HARVEST LOOP
+-- ─────────────────────────────────────────
+task.spawn(function()
+	if not isFH() then
+		return
+	end
+	setStatus("Fall Harvest – confirm user + arm loop", Color3.fromRGB(160, 160, 170))
+
+	while gui.Parent and isFH() do
+		local okLoop, errLoop = pcall(function()
+			task.wait(10)
+			if not gui.Parent or not isFH() or busy then
+				return
+			end
+			if not fhArmed() then
+				setStatus("FH loop idle", Color3.fromRGB(160, 160, 170))
+				return
+			end
+
+			local username, userId, display = loadRecipient()
+			local cat = catDrop.Get()
+			local item = itemDrop.Get()
+			local wantCount = math.floor(tonumber(countBox.Text) or 0)
+			persistSelection()
+
+			if not userId or userId <= 0 or not item or item == "" or wantCount <= 0 then
+				setStatus("FH: missing recipient / item / count", Color3.fromRGB(255, 180, 80))
+				return
+			end
+
+			busy = true
+			setStatus(
+				string.format("FH: checking mail from %s for %s…", tostring(display), item),
+				Color3.fromRGB(200, 200, 100)
+			)
+
+			local okClaim, unitsFound, mailsClaimed, detail = claimMatchingFromUser(
+				userId,
+				display ~= "" and display or username,
+				item,
+				cat
+			)
+
+			if not okClaim then
+				setStatus(string.format("FH: waiting – %s", tostring(detail)), Color3.fromRGB(255, 180, 80))
+				busy = false
+				updateInfo()
+				return
+			end
+
+			-- Must have enough units from mail for the full requested amount
+			if unitsFound < wantCount then
+				setStatus(
+					string.format(
+						"FH: only got %d/%d of %s from mail – waiting for more",
+						unitsFound, wantCount, item
+					),
+					Color3.fromRGB(255, 180, 80)
+				)
+				busy = false
+				updateInfo()
+				return
+			end
+
+			local sendCount = wantCount -- full amount only
+			task.wait(0.6)
+
+			local tier = lowestTierFor(item, cat)
+			local need = math.ceil(sendCount / unitsPerMail(cat))
+			setStatus(
+				string.format(
+					"FH: claimed enough → Magic-Mailing %s x%d via %s (%d mail(s))…",
+					item, sendCount, tostring(tier), need
+				),
+				Color3.fromRGB(200, 200, 100)
+			)
+
+			local ok, msg, mailsUsed, unitsSent, tierUsed = magicMailSendTotal(cat, item, sendCount)
+
+			-- HARD GATE: only travel if every unit was accepted
+			if ok and unitsSent >= sendCount then
+				setStatus(
+					string.format(
+						"FH: fully sent %d/%d with %d× %s – traveling GV…",
+						unitsSent, sendCount, mailsUsed, tostring(tierUsed)
+					),
+					Color3.fromRGB(80, 220, 120)
+				)
+				setPipeline(true)
+				busy = false
+				task.wait(0.8)
+				travelTo("Main")
+				return "TRAVEL"
+			else
+				setStatus(
+					string.format(
+						"FH: incomplete Magic Mail %d/%d – %s (NO travel, retry)",
+						unitsSent or 0, sendCount, tostring(msg)
+					),
+					Color3.fromRGB(255, 140, 80)
+				)
+				-- Do not arm GV pipeline on partial failure
+				setPipeline(false)
+				busy = false
+				updateInfo()
+			end
+		end)
+
+		if not okLoop then
+			warn("[MMT] FH loop error:", errLoop)
+			busy = false
+			setStatus("FH loop error – " .. tostring(errLoop), Color3.fromRGB(255, 80, 80))
+		elseif errLoop == "TRAVEL" then
+			return
+		end
+	end
+end)
+
+-- ─────────────────────────────────────────
+-- GARDEN VALLEY PIPELINE
+-- ─────────────────────────────────────────
+task.spawn(function()
+	if not isGV() then
+		return
+	end
+	if not pipelineArmed() then
+		setStatus("GV: pipeline not armed", Color3.fromRGB(255, 180, 80))
+		return
+	end
+
+	local username, userId, display = loadRecipient()
+	if not userId or userId <= 0 then
+		setStatus("GV: no recipient saved", Color3.fromRGB(255, 90, 90))
+		setPipeline(false)
+		return
+	end
+
+	for i = 3, 1, -1 do
+		if not gui.Parent then
+			return
+		end
+		setStatus(
+			string.format("GV pipeline in %ds → mail %s → FH", i, tostring(display)),
+			Color3.fromRGB(200, 200, 100)
+		)
+		task.wait(1)
+	end
+
+	busy = true
+	local okGV, errGV = pcall(function()
+		setStatus("GV: claiming Magic Mail…", Color3.fromRGB(200, 200, 100))
+		local n = claimAllMM()
+		updateInfo()
+
+		if n <= 0 or #claimedForMail == 0 then
+			setStatus("GV: nothing in Magic Mail escrow", Color3.fromRGB(255, 180, 80))
+			setPipeline(false)
+			return
+		end
+
+		setStatus(
+			string.format("GV: mailing %d stack(s) to %s…", #claimedForMail, tostring(display)),
+			Color3.fromRGB(200, 200, 100)
+		)
+		local ok, msg = sendMailBatches(userId, claimedForMail, "")
+		if not ok then
+			setStatus("GV: mail failed – " .. tostring(msg), Color3.fromRGB(255, 140, 80))
+			setPipeline(false)
+			return
+		end
+
+		setStatus("GV: done – returning to Fall Harvest…", Color3.fromRGB(80, 220, 120))
+		setPipeline(false)
+		task.wait(0.8)
+		travelTo("FallHarvest")
+	end)
+
+	busy = false
+	if not okGV then
+		warn("[MMT] GV pipeline error:", errGV)
+		setPipeline(false)
+		setStatus("GV error – " .. tostring(errGV), Color3.fromRGB(255, 80, 80))
+	end
+end)
+
+print("[MMT] loaded | FH armed:", fhArmed(), "| GV pipeline:", pipelineArmed())
